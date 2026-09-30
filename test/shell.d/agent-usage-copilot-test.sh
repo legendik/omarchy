@@ -12,16 +12,27 @@ export TZ=UTC
 TEST_HOME=$(mktemp -d)
 EMPTY_HOME=$(mktemp -d)
 TRANSCRIPT_HOME=$(mktemp -d)
+MIDNIGHT_HOME=$(mktemp -d)
 HISTORY_HOME=$(mktemp -d)
-trap 'rm -rf "$TEST_HOME" "$EMPTY_HOME" "$TRANSCRIPT_HOME" "$HISTORY_HOME"' EXIT
+trap 'rm -rf "$TEST_HOME" "$EMPTY_HOME" "$TRANSCRIPT_HOME" "$MIDNIGHT_HOME" "$HISTORY_HOME"' EXIT
 
-for home in "$TEST_HOME" "$EMPTY_HOME" "$TRANSCRIPT_HOME" "$HISTORY_HOME"; do
+for home in "$TEST_HOME" "$EMPTY_HOME" "$TRANSCRIPT_HOME" "$MIDNIGHT_HOME" "$HISTORY_HOME"; do
   mkdir -p "$home/.copilot/session-state" "$home/.config/omarchy/agents" "$home/.cache"
   printf '{"plan": "pro", "remote": false}' >"$home/.config/omarchy/agents/copilot.json"
 done
 rm -rf "$EMPTY_HOME/.copilot"
 
+# Every collector run below re-derives "today" and the allowance month from
+# the clock, and compares them with the stamps taken here. Starting too close to
+# UTC midnight (under TZ=UTC also the month boundary) lets them diverge mid-run,
+# so wait for the new day instead.
+seconds_to_midnight=$(( 86400 - $(date -u +%s) % 86400 ))
+if (( seconds_to_midnight < 120 )); then
+  sleep "$seconds_to_midnight"
+fi
+
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+yesterday=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
 today=$(date +%F)
 
 run_collector_in() {
@@ -245,6 +256,34 @@ pass "Copilot transcript fallback sums today's tokens"
 [[ $(jq -r '.limits[0].percent' <<<"$result") == "0.002" ]] ||
   fail "Copilot transcript fallback estimates spend from shutdown cost" "$result"
 pass "Copilot transcript fallback estimates spend from shutdown cost"
+
+# A segment that spans midnight books its shutdown totals on the days its
+# replies landed on: output by each day's reply output (40 / 60), everything
+# else by reply count (2 / 1).
+mkdir -p "$MIDNIGHT_HOME/.copilot/session-state/sess-m"
+jq -nc --arg ts "$now" --arg before "$yesterday" '
+  def ev($type; $data; $at): {type: $type, data: $data, id: "x", timestamp: $at};
+  ev("user.message"; {content: "late prompt"}; $before),
+  ev("assistant.message"; {model: "claude-sonnet-4.6", outputTokens: 30}; $before),
+  ev("assistant.message"; {model: "claude-sonnet-4.6", outputTokens: 10}; $before),
+  ev("assistant.message"; {model: "claude-sonnet-4.6", outputTokens: 60}; $ts),
+  ev("session.shutdown"; {shutdownType: "routine", modelMetrics: {
+    "claude-sonnet-4.6": {
+      usage: {inputTokens: 1300, outputTokens: 100, cacheReadTokens: 600, cacheWriteTokens: 100, reasoningTokens: 0},
+      totalNanoAiu: 0
+    }
+  }}; $ts)
+' >"$MIDNIGHT_HOME/.copilot/session-state/sess-m/events.jsonl"
+
+result=$(run_collector_in "$MIDNIGHT_HOME")
+
+[[ $(jq -r '.recentDays[-2].messageCount' <<<"$result") == "906" && $(jq -r '.recentDays[-1].messageCount' <<<"$result") == "494" && $(jq -r '.todayTotalTokens' <<<"$result") == "494" ]] ||
+  fail "Copilot transcript fallback books a midnight-spanning segment on both days" "$(jq -c '{recentDays, todayTotalTokens}' <<<"$result")"
+pass "Copilot transcript fallback books a midnight-spanning segment on both days"
+
+[[ $(jq -c '.modelUsage["claude-sonnet-4.6"]' <<<"$result") == '{"inputTokens":600,"outputTokens":100,"cacheReadInputTokens":600,"cacheCreationInputTokens":100}' ]] ||
+  fail "Copilot transcript fallback keeps a split segment's totals whole" "$result"
+pass "Copilot transcript fallback keeps a split segment's totals whole"
 
 # A machine that never ran the CLI reports nothing and stays hidden: no meter,
 # no ready.

@@ -454,9 +454,10 @@ def scan_store(conn: sqlite3.Connection) -> dict[str, Any]:
 #   or the CLI itself injected; those are not the user's prompts.
 # - session.shutdown carries data.modelMetrics: per-model token usage and cost
 #   (totalNanoAiu), cumulative for the session across resumes. The growth since
-#   the previous shutdown is the usage of the segment that just ended.
-# - assistant.message carries data.outputTokens per reply. It only stands in
-#   for a segment that is still running and so has no shutdown yet.
+#   the previous shutdown is the usage of the segment that just ended, spread
+#   over the days that segment's replies landed on.
+# - assistant.message carries data.outputTokens per reply. It dates a segment's
+#   usage, and stands in for a segment still running with no shutdown yet.
 
 
 def is_prompt(event_type: Any, data: dict[str, Any]) -> bool:
@@ -489,6 +490,61 @@ def shutdown_metrics(data: dict[str, Any]) -> dict[str, dict[str, float]]:
     return totals
 
 
+def apportion(total: int, weights: list[int]) -> list[int]:
+    """Split a whole total in proportion to positive weights, summing exactly."""
+    whole = sum(weights)
+    shares: list[int] = []
+    given = 0
+    running = 0
+    for weight in weights:
+        running += weight
+        share = total * running // whole - given
+        shares.append(share)
+        given += share
+    return shares
+
+
+Reply = tuple[str, str, str, int]  # model, local day, UTC month, output tokens
+
+
+def spread_segment(
+    tally: UsageTally,
+    model: str,
+    delta: dict[str, int],
+    credits: float,
+    replies: list[Reply],
+    shutdown_slot: tuple[str, str],
+) -> None:
+    """Book one model's usage for a finished segment on the days it happened.
+
+    A segment can span midnight, and its shutdown only reports totals. Output
+    splits by each day's reply output, which the transcript records exactly.
+    Input, cache, and cost split by reply count: every reply is one model call
+    that resends the context, so calls, not output, track what was read.
+    """
+    slots: dict[tuple[str, str], list[int]] = {}
+    for reply_model, day, month_key, output in replies:
+        if reply_model == model:
+            slot = slots.setdefault((day, month_key), [0, 0])
+            slot[0] += 1
+            slot[1] += output
+    if not slots:
+        slots[shutdown_slot] = [1, 0]
+
+    calls = [counts[0] for counts in slots.values()]
+    outputs = [counts[1] for counts in slots.values()]
+    if sum(outputs) <= 0:
+        outputs = calls
+    split = {
+        key: apportion(delta[key], outputs if key == "outputTokens" else calls)
+        for key in TOKEN_KEYS
+    }
+    all_calls = sum(calls)
+    for index, (day, month_key) in enumerate(slots):
+        tally.usage(model, day, {key: split[key][index] for key in TOKEN_KEYS})
+        tally.spend(month_key, credits * calls[index] / all_calls)
+
+
 def scan_transcript(event_file: Path, session_key: str, tally: UsageTally) -> None:
     try:
         session_mtime = event_file.stat().st_mtime
@@ -497,7 +553,7 @@ def scan_transcript(event_file: Path, session_key: str, tally: UsageTally) -> No
 
     # Session totals as of the last shutdown, and the replies since then.
     reported: dict[str, dict[str, float]] = {}
-    unreported: list[tuple[str, str, int]] = []
+    replies: list[Reply] = []
 
     with event_file.open("r", encoding="utf-8", errors="replace") as handle:
         for raw in handle:
@@ -518,39 +574,36 @@ def scan_transcript(event_file: Path, session_key: str, tally: UsageTally) -> No
                     session_mtime, dt.timezone.utc
                 ).astimezone()
             day = parsed.date().isoformat() if parsed else tally.today
+            month_key = (
+                parsed.astimezone(dt.timezone.utc).strftime("%Y-%m") if parsed else ""
+            )
 
             if is_prompt(event_type, data):
                 tally.prompt(session_key, day)
             elif event_type == "assistant.message":
-                output = number(data.get("outputTokens"))
-                if output > 0:
-                    model = clean_name(data.get("model")) or "copilot"
-                    unreported.append((model, day, output))
-            elif event_type == "session.shutdown":
-                # The shutdown totals already count every reply since the
-                # previous one, so those stand-ins are dropped, not added.
-                unreported.clear()
-                month_key = (
-                    parsed.astimezone(dt.timezone.utc).strftime("%Y-%m")
-                    if parsed
-                    else ""
+                model = clean_name(data.get("model")) or "copilot"
+                replies.append(
+                    (model, day, month_key, number(data.get("outputTokens")))
                 )
+            elif event_type == "session.shutdown":
                 for model, totals in shutdown_metrics(data).items():
                     before = reported.get(model, {})
-                    tally.usage(
+                    spread_segment(
+                        tally,
                         model,
-                        day,
                         {
                             key: max(0, int(totals[key] - before.get(key, 0)))
                             for key in TOKEN_KEYS
                         },
-                    )
-                    tally.spend(
-                        month_key, max(0.0, totals["credits"] - before.get("credits", 0.0))
+                        max(0.0, totals["credits"] - before.get("credits", 0.0)),
+                        replies,
+                        (day, month_key),
                     )
                     reported[model] = totals
+                # The shutdown totals already count these replies.
+                replies.clear()
 
-    for model, day, output in unreported:
+    for model, day, _month_key, output in replies:
         tally.usage(model, day, {**empty_bucket(), "outputTokens": output})
 
 
