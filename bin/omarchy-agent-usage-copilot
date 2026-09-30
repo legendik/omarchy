@@ -11,8 +11,9 @@ two local sources this collector reads. The primary one is the session store
 billed request with day, model, session, token split, and cost in nano AI
 units (1e9 nano units = 1 AI credit at 1 cent). The fallback, for CLI versions
 whose store predates that table, is the session transcript directory
-(~/.copilot/session-state/<id>/events.jsonl). The record prefers whichever
-source produced numbers, never both.
+(~/.copilot/session-state/<id>/events.jsonl), whose shutdown events carry the
+same per-model token split and cost. The record prefers whichever source
+produced numbers, never both.
 
 The monthly meter is an allowance of AI credits. GitHub's own account-wide
 figure is authoritative when the internal quota endpoint answers (the same one
@@ -34,10 +35,12 @@ the default allowance (Pro 1500, Pro+ 7000, Max 20000, Business 1900,
 Enterprise 3900 credits per month; existing seat-based customers may see
 higher promotional amounts through September 2026). monthlyCredits overrides
 the plan table, for AI-credit plans without a published number or for a
-personal budget. remote (default true) turns the account-wide quota probe on
-or off; the probe needs a token from COPILOT_QUOTA_TOKEN, GH_TOKEN,
-GITHUB_TOKEN, or `gh auth token`. The allowance window resets on the 1st of
-each month at 00:00 UTC, GitHub's own boundary.
+personal budget. The plan is not discoverable locally, so without plan or
+monthlyCredits there is no local estimate and no plan label. remote (default
+true) turns the account-wide quota probe on or off; the probe needs a token
+from COPILOT_QUOTA_TOKEN, GH_TOKEN, GITHUB_TOKEN, or `gh auth token`. The
+allowance window resets on the 1st of each month at 00:00 UTC, GitHub's own
+boundary.
 
 The agents panel only ever reads the JSON this prints.
 """
@@ -106,10 +109,10 @@ PLAN_LABELS = {
     "enterprise": "Enterprise",
 }
 
-# Resource ceilings. The session store is mutable and grows without bound, so
-# every read is capped: a runaway database can never produce a runaway record.
+# The session store is mutable and grows without bound, so it is size-capped
+# before it is snapshotted. Every scan aggregates as it streams, so the record's
+# size depends on days and models, never on the number of rows.
 MAX_DB_BYTES = 512 * 1024 * 1024
-MAX_EVENT_ROWS = 20_000
 
 SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
@@ -150,13 +153,16 @@ def cache_root() -> Path:
     return root
 
 
+TOKEN_KEYS = (
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+)
+
+
 def empty_bucket() -> dict[str, int]:
-    return {
-        "inputTokens": 0,
-        "outputTokens": 0,
-        "cacheReadInputTokens": 0,
-        "cacheCreationInputTokens": 0,
-    }
+    return dict.fromkeys(TOKEN_KEYS, 0)
 
 
 def local_date_string() -> str:
@@ -179,12 +185,36 @@ def next_month_start(now: dt.datetime) -> dt.datetime:
     return month_start(now) + dt.timedelta(days=days)
 
 
-def credits_from_nano(nano: Any) -> float:
+def positive_float(value: Any) -> float:
     try:
-        value = float(nano or 0)
+        n = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
-    return value / ULTRA_SECONDS if value > 0 else 0.0
+    return n if n > 0 else 0.0
+
+
+def credits_from_nano(nano: Any) -> float:
+    return positive_float(nano) / ULTRA_SECONDS
+
+
+def token_split(
+    prompt_tokens: Any, output_tokens: Any, cache_read: Any, cache_write: Any
+) -> dict[str, int]:
+    """Map Copilot's token counts onto the panel's four disjoint buckets.
+
+    Copilot's input count is the whole prompt, cache reads and writes included,
+    and its output count already includes reasoning tokens. The buckets are
+    disjoint, like the other collectors', so the cached part comes off input
+    and reasoning is never added a second time.
+    """
+    read = number(cache_read)
+    write = number(cache_write)
+    return {
+        "inputTokens": max(0, number(prompt_tokens) - read - write),
+        "outputTokens": number(output_tokens),
+        "cacheReadInputTokens": read,
+        "cacheCreationInputTokens": write,
+    }
 
 
 def clean_name(value: Any) -> str:
@@ -304,268 +334,239 @@ def blank_stats() -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------- aggregate
+
+
+class UsageTally:
+    """Running aggregate shared by both scans.
+
+    It grows with days, sessions, and models, never with raw events, so a scan
+    can stream an entire store or transcript directory through it.
+    """
+
+    def __init__(self) -> None:
+        self.today = local_date_string()
+        self.recent = {
+            day: {"date": day, "messageCount": 0} for day in recent_date_strings()
+        }
+        self.current_utc_month = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
+        self.sessions: set[str] = set()
+        self.active_dates: set[str] = set()
+        self.today_sessions: set[str] = set()
+        self.today_prompts = 0
+        self.today_total_tokens = 0
+        self.today_tokens_by_model: dict[str, int] = {}
+        self.total_prompts = 0
+        self.model_usage: dict[str, dict[str, int]] = {}
+        self.month_credits = 0.0
+
+    def prompt(self, session_key: str, day: str) -> None:
+        self.total_prompts += 1
+        self.sessions.add(session_key)
+        self.active_dates.add(day)
+        if day == self.today:
+            self.today_prompts += 1
+            self.today_sessions.add(session_key)
+
+    def usage(self, model: str, day: str, tokens: dict[str, int]) -> None:
+        total = sum(tokens[key] for key in TOKEN_KEYS)
+        if total <= 0:
+            return
+        bucket = self.model_usage.setdefault(model, empty_bucket())
+        for key in TOKEN_KEYS:
+            bucket[key] += tokens[key]
+        if day in self.recent:
+            self.recent[day]["messageCount"] += total
+        if day == self.today:
+            self.today_total_tokens += total
+            self.today_tokens_by_model[model] = (
+                self.today_tokens_by_model.get(model, 0) + total
+            )
+
+    def spend(self, month_key: str, credits: float) -> None:
+        # The allowance window is the current UTC month, matching the reset
+        # boundary; older spend belongs to windows that are already over.
+        if month_key == self.current_utc_month:
+            self.month_credits += credits
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "todayPrompts": self.today_prompts,
+            "todaySessions": len(self.today_sessions),
+            "todayTotalTokens": self.today_total_tokens,
+            "todayTokensByModel": self.today_tokens_by_model,
+            "recentDays": [self.recent[day] for day in recent_date_strings()],
+            "modelUsage": self.model_usage,
+            "totalPrompts": self.total_prompts,
+            "totalSessions": len(self.sessions),
+            "activeDays": len(self.active_dates),
+            "activeDates": sorted(self.active_dates),
+            "monthCredits": round(self.month_credits, 6),
+        }
+
+
 # ---------------------------------------------------------- store scan
 #
 # The session store's assistant_usage_events table records one row per billed
 # assistant request with day, model, session, the token split, and the cost in
-# total_nano_aiu. Aggregation happens in Python so the timestamp parsing is the
-# same lenient routine everywhere else in the repo uses, and so the LIMIT caps
-# raw rows rather than the answer's shape.
+# total_nano_aiu. Rows stream through the tally rather than being fetched, so
+# lifetime totals cover the whole store at constant memory, and timestamps go
+# through the same lenient parser the transcript fallback uses.
 
 
 def scan_store(conn: sqlite3.Connection) -> dict[str, Any]:
-    today = local_date_string()
-    recent = {day: {"date": day, "messageCount": 0} for day in recent_date_strings()}
-    current_utc_month = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
-
-    sessions: set[str] = set()
-    active_dates: set[str] = set()
-    today_sessions: set[str] = set()
-    today_prompts = 0
-    today_total_tokens = 0
-    today_tokens_by_model: dict[str, int] = {}
-    total_prompts = 0
-    model_usage: dict[str, dict[str, int]] = {}
-    month_credits = 0.0
-
+    tally = UsageTally()
     try:
         rows = conn.execute(
-            "SELECT session_id, model, created_at, total_nano_aiu,"
-            " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,"
-            # Newest rows first, so the row cap sacrifices history rather than the
-            # today/recent numbers the panel exists to show.
-            " reasoning_tokens FROM assistant_usage_events ORDER BY rowid DESC LIMIT ?",
-            (MAX_EVENT_ROWS,),
-        ).fetchall()
+            "SELECT session_id, model, created_at, total_nano_aiu, input_tokens,"
+            " output_tokens, cache_read_tokens, cache_write_tokens"
+            " FROM assistant_usage_events"
+        )
+        for row in rows:
+            session_id = clean_name(row["session_id"])
+            day = local_day(row["created_at"])
+            tally.prompt(session_id or "unknown", day)
+            tally.spend(
+                utc_month_key(row["created_at"]),
+                credits_from_nano(row["total_nano_aiu"]),
+            )
+            tally.usage(
+                clean_name(row["model"]) or "copilot",
+                day,
+                token_split(
+                    row["input_tokens"],
+                    row["output_tokens"],
+                    row["cache_read_tokens"],
+                    row["cache_write_tokens"],
+                ),
+            )
     except sqlite3.Error:
         return blank_stats()
-
-    for row in rows:
-        session_id = clean_name(row["session_id"])
-        session_key = session_id if session_id else "unknown"
-        model = clean_name(row["model"]) or "copilot"
-        day = local_day(row["created_at"])
-        month_key = utc_month_key(row["created_at"])
-
-        total_prompts += 1
-        sessions.add(session_key)
-        active_dates.add(day)
-        # The allowance window is the current UTC month, matching the reset
-        # boundary; older spend belongs to windows that are already over.
-        if month_key == current_utc_month:
-            month_credits += credits_from_nano(row["total_nano_aiu"])
-
-        # Reasoning tokens are generated, so they fold into output the same way
-        # the other collectors count them.
-        input_tokens = number(row["input_tokens"])
-        output_tokens = number(row["output_tokens"]) + number(row["reasoning_tokens"])
-        cache_read = number(row["cache_read_tokens"])
-        cache_write = number(row["cache_write_tokens"])
-        total = input_tokens + output_tokens + cache_read + cache_write
-
-        bucket = model_usage.setdefault(model, empty_bucket())
-        bucket["inputTokens"] += input_tokens
-        bucket["outputTokens"] += output_tokens
-        bucket["cacheReadInputTokens"] += cache_read
-        bucket["cacheCreationInputTokens"] += cache_write
-
-        if day in recent and total > 0:
-            recent[day]["messageCount"] += total
-        if day == today:
-            today_prompts += 1
-            today_sessions.add(session_key)
-            today_total_tokens += total
-            today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
-
-    return {
-        "todayPrompts": today_prompts,
-        "todaySessions": len(today_sessions),
-        "todayTotalTokens": today_total_tokens,
-        "todayTokensByModel": today_tokens_by_model,
-        "recentDays": [recent[day] for day in recent_date_strings()],
-        "modelUsage": model_usage,
-        "totalPrompts": total_prompts,
-        "totalSessions": len(sessions),
-        "activeDays": len(active_dates),
-        "activeDates": sorted(active_dates),
-        "monthCredits": round(month_credits, 6),
-    }
+    return tally.stats()
 
 
 # ------------------------------------------------------ transcript fallback
 #
-# A CLI whose store predates the assistant_usage_events table still writes
-# session transcripts. The fallback scans them for prompt and token counts
-# only — no cost, so no monthly credit estimate. It is only consulted when
-# the store is missing its usage table or empty.
+# A CLI whose store predates the assistant_usage_events table still writes one
+# events.jsonl per session, one {"type", "timestamp", "data"} event per line:
+#
+# - user.message is a prompt. data.source marks messages a skill, a subagent,
+#   or the CLI itself injected; those are not the user's prompts.
+# - session.shutdown carries data.modelMetrics: per-model token usage and cost
+#   (totalNanoAiu), cumulative for the session across resumes. The growth since
+#   the previous shutdown is the usage of the segment that just ended.
+# - assistant.message carries data.outputTokens per reply. It only stands in
+#   for a segment that is still running and so has no shutdown yet.
 
 
-def is_prompt(entry: dict[str, Any]) -> bool:
-    kind = entry.get("kind")
-    if isinstance(kind, str) and kind == "user_message":
-        return True
-    event_type = entry.get("type")
-    if isinstance(event_type, str):
-        if event_type in ("user_message", "user", "human"):
-            return True
-        if event_type == "message" and str(entry.get("role") or "").lower() in (
-            "user",
-            "human",
-        ):
-            return True
-    return False
+def is_prompt(event_type: Any, data: dict[str, Any]) -> bool:
+    return event_type == "user.message" and clean_name(data.get("source")) in (
+        "",
+        "user",
+    )
 
 
-def token_field(value: Any) -> int:
-    if isinstance(value, dict):
-        return number(value.get("text") or value.get("tokens") or value.get("value"))
-    return number(value)
-
-
-def extract_usage(entry: dict[str, Any]) -> dict[str, int] | None:
-    usage = entry.get("usage")
-    if not isinstance(usage, dict):
-        usage = {}
-
-    tokens = usage.get("tokens")
-    if isinstance(tokens, dict):
-        inp = tokens.get("input") if isinstance(tokens.get("input"), dict) else {}
-        out = tokens.get("output") if isinstance(tokens.get("output"), dict) else {}
-        input_tokens = token_field(inp.get("text"))
-        output_tokens = token_field(out.get("text")) + token_field(out.get("reasoning"))
-        cache_read = token_field(inp.get("cached") or inp.get("cacheRead"))
-        if input_tokens or output_tokens or cache_read:
-            return {
-                "inputTokens": input_tokens,
-                "outputTokens": output_tokens,
-                "cacheReadInputTokens": cache_read,
-                "cacheCreationInputTokens": 0,
-            }
-
-    input_tokens = number(usage.get("inputTokens", usage.get("input")))
-    output_tokens = number(usage.get("outputTokens", usage.get("output")))
-    cache_read = number(usage.get("cacheReadInputTokens", usage.get("cacheRead")))
-    cache_write = number(usage.get("cacheCreationInputTokens", usage.get("cacheWrite")))
-    if not (input_tokens or output_tokens or cache_read or cache_write):
-        input_tokens = number(entry.get("inputTokens", entry.get("promptTokens")))
-        output_tokens = number(entry.get("outputTokens", entry.get("completionTokens")))
-    if input_tokens or output_tokens or cache_read or cache_write:
-        return {
-            "inputTokens": input_tokens,
-            "outputTokens": output_tokens,
-            "cacheReadInputTokens": cache_read,
-            "cacheCreationInputTokens": cache_write,
+def shutdown_metrics(data: dict[str, Any]) -> dict[str, dict[str, float]]:
+    metrics = data.get("modelMetrics")
+    if not isinstance(metrics, dict):
+        return {}
+    totals: dict[str, dict[str, float]] = {}
+    for model, entry in metrics.items():
+        if not isinstance(entry, dict):
+            continue
+        usage = entry.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        totals[clean_name(model) or "copilot"] = {
+            **token_split(
+                usage.get("inputTokens"),
+                usage.get("outputTokens"),
+                usage.get("cacheReadTokens"),
+                usage.get("cacheWriteTokens"),
+            ),
+            "credits": credits_from_nano(entry.get("totalNanoAiu")),
         }
-    return None
+    return totals
+
+
+def scan_transcript(event_file: Path, session_key: str, tally: UsageTally) -> None:
+    try:
+        session_mtime = event_file.stat().st_mtime
+    except OSError:
+        session_mtime = 0.0
+
+    # Session totals as of the last shutdown, and the replies since then.
+    reported: dict[str, dict[str, float]] = {}
+    unreported: list[tuple[str, str, int]] = []
+
+    with event_file.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            event_type = entry.get("type")
+            data = entry.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            parsed = parse_event_time(entry.get("timestamp"))
+            if parsed is None and session_mtime > 0:
+                parsed = dt.datetime.fromtimestamp(
+                    session_mtime, dt.timezone.utc
+                ).astimezone()
+            day = parsed.date().isoformat() if parsed else tally.today
+
+            if is_prompt(event_type, data):
+                tally.prompt(session_key, day)
+            elif event_type == "assistant.message":
+                output = number(data.get("outputTokens"))
+                if output > 0:
+                    model = clean_name(data.get("model")) or "copilot"
+                    unreported.append((model, day, output))
+            elif event_type == "session.shutdown":
+                # The shutdown totals already count every reply since the
+                # previous one, so those stand-ins are dropped, not added.
+                unreported.clear()
+                month_key = (
+                    parsed.astimezone(dt.timezone.utc).strftime("%Y-%m")
+                    if parsed
+                    else ""
+                )
+                for model, totals in shutdown_metrics(data).items():
+                    before = reported.get(model, {})
+                    tally.usage(
+                        model,
+                        day,
+                        {
+                            key: max(0, int(totals[key] - before.get(key, 0)))
+                            for key in TOKEN_KEYS
+                        },
+                    )
+                    tally.spend(
+                        month_key, max(0.0, totals["credits"] - before.get("credits", 0.0))
+                    )
+                    reported[model] = totals
+
+    for model, day, output in unreported:
+        tally.usage(model, day, {**empty_bucket(), "outputTokens": output})
 
 
 def scan_transcripts(session_root: Path) -> dict[str, Any]:
-    today = local_date_string()
-    recent = {day: {"date": day, "messageCount": 0} for day in recent_date_strings()}
-
-    sessions: set[str] = set()
-    active_dates: set[str] = set()
-    today_sessions: set[str] = set()
-    today_prompts = 0
-    today_total_tokens = 0
-    today_tokens_by_model: dict[str, int] = {}
-    total_prompts = 0
-    model_usage: dict[str, dict[str, int]] = {}
-
     if not session_root.is_dir():
         return blank_stats()
-
+    tally = UsageTally()
     for session_dir in sorted(p for p in session_root.iterdir() if p.is_dir()):
         event_file = session_dir / "events.jsonl"
         if not event_file.is_file():
             continue
-        session_key = session_dir.name
         try:
-            session_mtime = event_file.stat().st_mtime
-        except OSError:
-            session_mtime = 0.0
-
-        try:
-            with event_file.open("r", encoding="utf-8", errors="replace") as handle:
-                for line_number, raw in enumerate(handle, 1):
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-
-                    prompt = is_prompt(entry)
-                    usage = extract_usage(entry)
-                    if not prompt and usage is None:
-                        continue
-
-                    parsed = parse_event_time(
-                        entry.get("timestamp")
-                        or entry.get("time")
-                        or entry.get("createdAt")
-                    )
-                    if parsed is None and session_mtime > 0:
-                        parsed = dt.datetime.fromtimestamp(
-                            session_mtime, dt.timezone.utc
-                        ).astimezone()
-                    day = parsed.date().isoformat() if parsed else today
-                    model = (
-                        clean_name(
-                            entry.get("model")
-                            or entry.get("modelID")
-                            or entry.get("model_id")
-                            or entry.get("model_slug")
-                        )
-                        or "copilot"
-                    )
-
-                    if prompt:
-                        total_prompts += 1
-                        sessions.add(session_key)
-                        active_dates.add(day)
-                        if day == today:
-                            today_prompts += 1
-                            today_sessions.add(session_key)
-
-                    if usage is not None:
-                        input_tokens = usage["inputTokens"]
-                        output_tokens = usage["outputTokens"]
-                        cache_read = usage["cacheReadInputTokens"]
-                        cache_write = usage["cacheCreationInputTokens"]
-                        total = input_tokens + output_tokens + cache_read + cache_write
-                        if total > 0:
-                            bucket = model_usage.setdefault(model, empty_bucket())
-                            bucket["inputTokens"] += input_tokens
-                            bucket["outputTokens"] += output_tokens
-                            bucket["cacheReadInputTokens"] += cache_read
-                            bucket["cacheCreationInputTokens"] += cache_write
-                            if day in recent:
-                                recent[day]["messageCount"] += total
-                            if day == today:
-                                today_total_tokens += total
-                                today_tokens_by_model[model] = (
-                                    today_tokens_by_model.get(model, 0) + total
-                                )
+            scan_transcript(event_file, session_dir.name, tally)
         except OSError:
             continue
-
-    return {
-        "todayPrompts": today_prompts,
-        "todaySessions": len(today_sessions),
-        "todayTotalTokens": today_total_tokens,
-        "todayTokensByModel": today_tokens_by_model,
-        "recentDays": [recent[day] for day in recent_date_strings()],
-        "modelUsage": model_usage,
-        "totalPrompts": total_prompts,
-        "totalSessions": len(sessions),
-        "activeDays": len(active_dates),
-        "activeDates": sorted(active_dates),
-        "monthCredits": 0.0,
-    }
+    return tally.stats()
 
 
 # ------------------------------------------------------------------- cache
@@ -765,11 +766,13 @@ def fetch_remote_quota() -> dict[str, Any]:
 
     plan_key, plan_label = api_plan(payload.get("copilot_plan"))
     orgs = payload.get("organization_login_list")
+    # Under token-based billing the snapshot counts AI credits directly; only
+    # the local store and transcripts count in nano units.
     return {
         "available": True,
         "unlimited": bool(snapshot.get("unlimited")),
-        "entitlement": round(credits_from_nano(snapshot.get("entitlement")), 6),
-        "used": round(credits_from_nano(snapshot.get("credits_used")), 6),
+        "entitlement": positive_float(snapshot.get("entitlement")),
+        "used": positive_float(snapshot.get("credits_used")),
         "resetsAt": str(payload.get("quota_reset_date_utc") or ""),
         "plan": plan_key,
         "planLabel": plan_label,
@@ -782,18 +785,23 @@ def fetch_remote_quota() -> dict[str, Any]:
 
 
 def resolve_plan(config: dict[str, Any]) -> tuple[str, float]:
-    raw = str(config.get("plan") or "pro").strip().lower()
+    """Return the configured plan key and its monthly allowance in credits.
+
+    The plan is not discoverable locally, so a missing or unrecognized plan
+    stays unknown (key "") instead of defaulting to a tier the user may not
+    have; only monthlyCredits can then give the estimate an allowance.
+    """
+    raw = str(config.get("plan") or "").strip().lower()
     key = raw.replace(" ", "").replace("copilot", "")
     if key in ("proplus", "pro-plus"):
         key = "pro+"
-    if not key:
-        key = "pro"
+    if key not in PLAN_LABELS:
+        key = ""
 
     override = config.get("monthlyCredits")
     if isinstance(override, (int, float)) and override > 0:
         return key, float(override)
-    allowance = float(PLAN_ALLOWANCES.get(key, 0))
-    return key, allowance
+    return key, float(PLAN_ALLOWANCES.get(key, 0))
 
 
 def allowance_limits(
@@ -804,7 +812,7 @@ def allowance_limits(
     has_stats: bool,
 ) -> dict[str, Any]:
     plan_key, plan_allowance = resolve_plan(config)
-    plan_label = PLAN_LABELS.get(plan_key, "Copilot")
+    plan_label = PLAN_LABELS.get(plan_key, "")
     estimated = True
     allow = plan_allowance
     used = month_credits

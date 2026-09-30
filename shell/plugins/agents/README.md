@@ -74,9 +74,9 @@ the Copilot CLI keeps locally. Its session store (`~/.copilot/session-store.db`)
 records every billed request in an `assistant_usage_events` table: day, model,
 session, the token split, and the cost in nano AI units (1e9 nano units = 1
 AI credit ≈ $0.01). The panel's token sections come from that table; CLI
-versions whose store predates it are served by scanning the session
-transcripts under `~/.copilot/session-state` instead. Neither source is
-network-dependent.
+versions whose store predates it are served by the session transcripts under
+`~/.copilot/session-state` instead, whose `session.shutdown` events carry the
+same per-model token split and cost. Neither source is network-dependent.
 
 The monthly meter is an allowance of AI credits. The account-wide figure
 comes from GitHub's internal quota endpoint (the same one the editor plugins
@@ -99,11 +99,12 @@ is configured in `~/.config/omarchy/agents/copilot.json`:
 Business 1900, Enterprise 3900 credits per month; existing seat-based
 customers may see promotional amounts through September 2026).
 `monthlyCredits` overrides the plan table, for AI-credit plans without a
-published number or for a personal budget. `remote` (default true) turns the
-account-wide quota probe on or off. The allowance window resets on the 1st of
-each month at 00:00 UTC, GitHub's own boundary. A limit labeled "(est.)" is
-the local estimate — this machine's CLI spend only; a plain "Monthly
-allowance" is the live account figure.
+published number or for a personal budget. With neither set there is no local
+estimate and no plan label, because the plan cannot be read from disk. `remote`
+(default true) turns the account-wide quota probe on or off. The allowance
+window resets on the 1st of each month at 00:00 UTC, GitHub's own boundary. A
+limit labeled "(est.)" is the local estimate — this machine's CLI spend only; a
+plain "Monthly allowance" is the live account figure.
 
 ### Fireworks balance
 
