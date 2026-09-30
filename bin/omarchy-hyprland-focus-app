@@ -15,13 +15,16 @@ app=${1:-}
 # Agent terminals notify as kitty/foot/etc. while their shared window class is
 # org.omarchy.agent, leaving the terminal name only in initialTitle. So match
 # by class first, then fall back to the launch-time title of agent windows.
+# Among several matches the most recently focused window wins, not whichever
+# hyprctl happens to list first.
 address=$(
   hyprctl clients -j 2>/dev/null |
     jq -r --arg pattern "$app" \
       'def matches($value): ($value // "") | test($pattern; "i");
+       sort_by(.focusHistoryID // 0) as $clients |
        first(
-         (.[] | select(matches(.class))),
-         (.[] | select(.initialClass == "org.omarchy.agent" and matches(.initialTitle)))
+         ($clients[] | select(matches(.class))),
+         ($clients[] | select(.initialClass == "org.omarchy.agent" and matches(.initialTitle)))
        ).address // empty'
 )
 
